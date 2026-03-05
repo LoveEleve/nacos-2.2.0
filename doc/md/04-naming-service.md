@@ -576,7 +576,324 @@ singletonRepository.computeIfAbsent(service, key -> {
 
 ---
 
-## 数据结构关系图
+## 补充章节：客户端 Naming SDK 核心机制
+
+> 对应章节 7-11（NamingGrpcRedoService、ServiceInfoHolder、ServiceInfoUpdateService、事件通知体系、FailoverReactor）  
+> 源码路径：`client/src/main/java/com/alibaba/nacos/client/naming/`
+
+---
+
+### S1. NamingGrpcRedoService — 连接恢复后自动重试
+
+#### 解决什么问题？
+
+客户端与服务端的 gRPC 连接断开后重连，之前注册的实例和订阅的服务在服务端已被清理。`NamingGrpcRedoService` 负责在重连成功后，**自动重新注册实例和重新订阅服务**，对业务代码完全透明。
+
+#### 数据结构
+
+```java
+// client/src/main/java/com/alibaba/nacos/client/naming/remote/gprc/redo/NamingGrpcRedoService.java
+public class NamingGrpcRedoService implements ConnectionEventListener {
+    
+    // ★ 注册重试数据：groupedServiceName → InstanceRedoData
+    private final ConcurrentMap<String, InstanceRedoData> registeredInstances = new ConcurrentHashMap<>();
+    
+    // ★ 订阅重试数据：serviceKey → SubscriberRedoData
+    private final ConcurrentMap<String, SubscriberRedoData> subscribes = new ConcurrentHashMap<>();
+    
+    // ★ 重试调度器（单线程，每 3000ms 执行一次）
+    private final ScheduledExecutorService redoExecutor;
+    
+    // ★ 连接状态标志（volatile 保证可见性）
+    private volatile boolean connected = false;
+    
+    private static final long DEFAULT_REDO_DELAY = 3000L;  // 重试间隔 3 秒
+}
+```
+
+**`RedoData` 状态机**（`InstanceRedoData` 和 `SubscriberRedoData` 的父类）：
+
+```java
+// RedoData.java
+public enum RedoType {
+    REGISTER,    // 需要重新注册/订阅
+    UNREGISTER,  // 需要重新注销/取消订阅
+    REMOVE,      // 已完成注销，可从 Map 中删除
+    NONE         // 无需重试（已成功注册且连接正常）
+}
+```
+
+| `registered` | `unregistering` | `RedoType` | 含义 |
+|-------------|----------------|-----------|------|
+| `false` | `false` | `REGISTER` | 需要重新注册 |
+| `true` | `false` | `NONE` | 已注册，无需重试 |
+| `true` | `true` | `UNREGISTER` | 需要重新注销 |
+| `false` | `true` | `REMOVE` | 注销完成，可删除 |
+
+#### 工作流程
+
+```
+① 注册实例时（registerInstance）
+    NamingGrpcClientProxy.registerService()
+        → redoService.cacheInstanceForRedo(serviceName, groupName, instance)
+        → 发送 InstanceRequest(REGISTER)
+        → 成功后：redoService.instanceRegistered(serviceName, groupName)
+                  （registered=true，RedoType=NONE）
+
+② 连接断开时（onDisConnect）
+    redoService.onDisConnect()
+        → connected = false
+        → 遍历 registeredInstances，将所有 registered 置为 false
+          （RedoType 变为 REGISTER，标记需要重试）
+        → 遍历 subscribes，同样标记
+
+③ 连接恢复时（onConnected）
+    redoService.onConnected()
+        → connected = true
+        → RedoScheduledTask 每 3s 执行一次：
+            if (!redoService.isConnected()) return;  // 未连接则跳过
+            redoForInstances()  // 重新注册所有 RedoType=REGISTER 的实例
+            redoForSubscribes() // 重新订阅所有 RedoType=REGISTER 的服务
+```
+
+**`RedoScheduledTask.redoForInstance()` 核心逻辑**：
+
+```java
+// RedoScheduledTask.java
+private void redoForInstance(InstanceRedoData redoData) throws NacosException {
+    switch (redoData.getRedoType()) {
+        case REGISTER:
+            // ★ 重新注册实例（普通注册 or 批量注册）
+            if (redoData instanceof BatchInstanceRedoData) {
+                clientProxy.doBatchRegisterService(serviceName, groupName, batchInstanceRedoData.getInstances());
+            } else {
+                clientProxy.doRegisterService(serviceName, groupName, redoData.get());
+            }
+            break;
+        case UNREGISTER:
+            // ★ 重新注销实例
+            clientProxy.doDeregisterService(serviceName, groupName, redoData.get());
+            break;
+        case REMOVE:
+            // ★ 注销完成，从 Map 中删除
+            redoService.removeInstanceForRedo(serviceName, groupName);
+            break;
+    }
+}
+```
+
+---
+
+### S2. ServiceInfoHolder — 客户端服务信息缓存
+
+#### 解决什么问题？
+
+客户端订阅服务后，需要在本地缓存服务实例列表，避免每次调用都查询服务端。同时需要将缓存持久化到磁盘，用于故障转移（`FailoverReactor`）。
+
+#### 数据结构
+
+```java
+// client/src/main/java/com/alibaba/nacos/client/naming/cache/ServiceInfoHolder.java
+public class ServiceInfoHolder implements Closeable {
+    
+    // ★ 内存缓存：serviceKey → ServiceInfo（实例列表）
+    private final ConcurrentHashMap<String, ServiceInfo> serviceInfoMap;
+    
+    // ★ 磁盘缓存目录（用于故障转移）
+    private String cacheDir;
+    
+    // ★ 故障转移反应器
+    private FailoverReactor failoverReactor;
+    
+    // ★ 是否开启推送空保护（服务端推送空列表时，保留本地缓存）
+    private boolean pushEmptyProtection;
+}
+```
+
+**`processServiceInfo()` — 处理服务端推送的实例列表**：
+
+```java
+public ServiceInfo processServiceInfo(ServiceInfo serviceInfo) {
+    String serviceKey = serviceInfo.getKey();
+    ServiceInfo oldService = serviceInfoMap.get(serviceKey);
+    
+    // ★ 推送空保护：服务端推送空列表时，保留本地缓存（防止服务端异常导致客户端无实例可用）
+    if (pushEmptyProtection && !serviceInfo.validate()) {
+        return oldService;
+    }
+    
+    // ★ 判断是否有变化（通过 JSON 序列化比对）
+    boolean changed = isChangedServiceInfo(oldService, serviceInfo);
+    if (StringUtils.isBlank(serviceInfo.getJsonFromServer())) {
+        serviceInfo.setJsonFromServer(JacksonUtils.toJson(serviceInfo));
+    }
+    
+    // ★ 更新内存缓存
+    serviceInfoMap.put(serviceKey, serviceInfo);
+    
+    if (changed) {
+        // ★ 写磁盘（异步，用于故障转移）
+        DiskCache.write(serviceInfo, cacheDir);
+        // ★ 发布 InstancesChangeEvent（通知业务监听器）
+        NotifyCenter.publishEvent(new InstancesChangeEvent(...));
+    }
+    return serviceInfo;
+}
+```
+
+---
+
+### S3. ServiceInfoUpdateService — 定时刷新服务信息
+
+#### 解决什么问题？
+
+gRPC Push 是主动推送，但网络抖动可能导致 Push 丢失。`ServiceInfoUpdateService` 作为**兜底机制**，定时主动拉取服务信息，确保客户端缓存最终一致。
+
+#### 数据结构
+
+```java
+// client/src/main/java/com/alibaba/nacos/client/naming/core/ServiceInfoUpdateService.java
+public class ServiceInfoUpdateService implements Closeable {
+    
+    // ★ 调度器（单线程）
+    private final ScheduledExecutorService executor;
+    
+    // ★ 正在更新的服务集合：serviceKey → UpdateTask
+    private final Map<String, ScheduledFuture<?>> futureMap = new HashMap<>(16);
+    
+    // ★ 默认刷新间隔（毫秒）
+    private static final long DEFAULT_DELAY = 1000L;
+    
+    // ★ 最大刷新间隔（毫秒）
+    private static final long MAX_DELAY = 60 * 1000L;
+}
+```
+
+**`UpdateTask` 的自适应刷新间隔**：
+
+```java
+// UpdateTask.run()
+public void run() {
+    long delayTime = DEFAULT_DELAY;
+    try {
+        ServiceInfo serviceObj = serviceInfoHolder.getServiceInfoMap().get(serviceKey);
+        if (serviceObj == null) {
+            // 本地无缓存，立即拉取
+            serviceObj = namingClientProxy.queryInstancesOfService(serviceName, groupName, clusters, false);
+            serviceInfoHolder.processServiceInfo(serviceObj);
+            lastRefTime = serviceObj.getLastRefTime();
+            return;
+        }
+        
+        if (serviceObj.getLastRefTime() <= lastRefTime) {
+            // ★ 服务信息未更新，延长刷新间隔（最大 60s）
+            serviceObj = namingClientProxy.queryInstancesOfService(serviceName, groupName, clusters, false);
+            serviceInfoHolder.processServiceInfo(serviceObj);
+        }
+        lastRefTime = serviceObj.getLastRefTime();
+        
+        // ★ 自适应间隔：取服务缓存时间（cacheMillis）和 DEFAULT_DELAY 的最大值
+        delayTime = serviceObj.getCacheMillis() * failCount;
+        failCount = Math.min(MAX_FAIL_COUNT, failCount);
+    } catch (Throwable e) {
+        failCount++;
+        delayTime = DEFAULT_DELAY;
+    } finally {
+        // ★ 重新调度（自适应间隔）
+        executor.schedule(this, Math.min(delayTime, MAX_DELAY), TimeUnit.MILLISECONDS);
+    }
+}
+```
+
+---
+
+### S4. FailoverReactor — 故障转移
+
+#### 解决什么问题？
+
+当 Nacos 服务端完全不可用时（网络分区、服务端宕机），客户端需要从**本地磁盘快照**读取服务实例列表，保证业务不中断。
+
+#### 数据结构
+
+```java
+// client/src/main/java/com/alibaba/nacos/client/naming/backups/FailoverReactor.java
+public class FailoverReactor implements Closeable {
+    
+    // ★ 故障转移数据：serviceKey → ServiceInfo（从磁盘加载）
+    private Map<String, ServiceInfo> serviceMap = new ConcurrentHashMap<>();
+    
+    // ★ 磁盘快照目录（与 ServiceInfoHolder 共用）
+    private final String failoverDir;
+    
+    // ★ 调度器
+    private final ScheduledExecutorService executorService;
+    
+    // ★ 故障转移开关文件名
+    private static final String FAILOVER_SWITCH = "00-00---000-VIPSRV_FAILOVER_SWITCH-000---00-00";
+}
+```
+
+**故障转移开关**：在 `failoverDir` 目录下创建名为 `00-00---000-VIPSRV_FAILOVER_SWITCH-000---00-00` 的文件，内容为 `1` 时开启故障转移模式。
+
+**工作流程**：
+
+```
+① 正常运行时（每 10s）
+    DiskFileWriter：将 serviceInfoMap 中的所有服务信息写入磁盘
+    （文件名 = serviceKey，内容 = ServiceInfo JSON）
+
+② 故障转移检测（每 5s）
+    SwitchRefresher：读取 FAILOVER_SWITCH 文件
+    → 内容为 "1"：开启故障转移，从磁盘加载所有服务信息到 serviceMap
+    → 内容为 "0"：关闭故障转移，清空 serviceMap
+
+③ 查询服务时
+    NamingClientProxyDelegate.getServiceInfo()
+        → if (failoverReactor.isFailoverSwitch())
+              return failoverReactor.getService(serviceKey)  // 从磁盘快照读取
+          else
+              return serviceInfoHolder.getServiceInfo(...)   // 从内存缓存读取
+```
+
+---
+
+### S5. 客户端事件通知体系
+
+#### 事件流转链路
+
+```
+服务端 Push（NotifySubscriberRequest）
+    │
+    ▼
+NamingPushRequestHandler.requestReply()
+    │ 调用 serviceInfoHolder.processServiceInfo()
+    ▼
+ServiceInfoHolder.processServiceInfo()
+    │ 发布 InstancesChangeEvent
+    ▼
+NotifyCenter（异步事件总线）
+    │
+    ▼
+NamingChangeNotifier.onEvent(InstancesChangeEvent)
+    │ 查找该服务的所有 EventListener
+    ▼
+AbstractEventListener.onEvent()
+    │ 提交到 Executor（异步执行，避免阻塞事件总线）
+    ▼
+用户注册的 EventListener.onEvent(NamingEvent)
+    （包含最新的 instances 列表）
+```
+
+**关键类**：
+
+| 类 | 作用 |
+|----|------|
+| `NamingPushRequestHandler` | 处理服务端 Push，调用 `serviceInfoHolder.processServiceInfo()` |
+| `InstancesChangeEvent` | 服务实例变更事件，携带 `serviceName`、`groupName`、`clusters`、`hosts` |
+| `NamingChangeNotifier` | 事件订阅者，维护 `serviceKey → List<EventListener>` 映射 |
+| `AbstractEventListener` | 用户监听器基类，内置线程池异步执行，防止阻塞 |
+
+
 
 ```mermaid
 classDiagram

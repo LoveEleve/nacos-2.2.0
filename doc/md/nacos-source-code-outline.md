@@ -21,6 +21,8 @@
 11. [存储层设计](#11-存储层设计)
 12. [生产环境核心配置与调优](#12-生产环境核心配置与调优)
 13. [高频面试题汇总](#13-高频面试题汇总)
+14. [流量控制插件：TPS 限流与连接控制](#14-流量控制插件tps-限流与连接控制)
+15. [能力协商机制（Ability）](#15-能力协商机制ability)
 
 ---
 
@@ -46,9 +48,12 @@ nacos-console (入口)
     │     ├── distributed/raft    (JRaft CP协议)
     │     ├── distributed/distro  (Distro AP协议)
     │     ├── remote/grpc         (gRPC通信)
-    │     └── cluster             (集群管理)
+    │     ├── cluster             (集群管理)
+    │     ├── ability             (能力协商)
+    │     └── control             (TPS限流拦截器)
     ├── nacos-consistency  (一致性协议抽象层)
     ├── nacos-auth         (鉴权)
+    ├── nacos-plugin/control  (TPS限流+连接控制插件)
     └── nacos-client       (客户端SDK)
 ```
 
@@ -861,7 +866,380 @@ Nacos 集成 Prometheus + Micrometer，关键指标：
 2. `DistroProtocol` Distro 协议完整流程
 3. `ProtocolManager` 协议管理器
 
+### 第五阶段：流量控制与能力协商（1-2天）
+1. `ControlManagerCenter` 插件初始化流程
+2. `NacosTpsControlManager` → `NacosTpsBarrier` → `LocalSimpleCountRateCounter` TPS 限流核心
+3. `TpsControlRequestFilter` / `NacosHttpTpsControlInterceptor` 拦截器集成
+4. `ServerAbilityInitializerHolder` → `GrpcBiStreamRequestAcceptor` 能力协商流程
+
 ---
 
-*文档生成时间：2026-03-04*  
+## 14. 流量控制插件：TPS 限流与连接控制
+
+> 对应模块：`plugin/control/`、`core/control/`  
+> 核心类：`ControlManagerCenter`、`TpsControlManager`、`ConnectionControlManager`
+
+### 14.1 整体架构
+
+`plugin/control/` 是 Nacos 2.x 引入的**可插拔流量控制体系**，通过 SPI 机制支持自定义实现。它包含两个独立的控制维度：
+
+| 控制维度 | 核心类 | 作用 |
+|----------|--------|------|
+| TPS 限流 | `TpsControlManager` | 限制每秒请求数（按接口粒度） |
+| 连接数控制 | `ConnectionControlManager` | 限制客户端连接总数 |
+
+**统一入口**：`ControlManagerCenter`（单例），负责通过 SPI 加载两个管理器的具体实现。
+
+```
+ControlManagerCenter（单例）
+    ├── TpsControlManager（SPI，默认 NacosTpsControlManager）
+    ├── ConnectionControlManager（SPI，默认 NacosConnectionControlManager）
+    ├── RuleParser（SPI，默认 NacosRuleParser）
+    └── RuleStorageProxy
+            ├── LocalDiskRuleStorage（本地磁盘）
+            └── ExternalRuleStorage（外部存储，SPI 扩展）
+```
+
+### 14.2 TPS 限流机制 ⭐⭐⭐
+
+#### 14.2.1 核心数据结构
+
+```
+TpsControlManager
+    └── Map<pointName, TpsBarrier>   // 每个接口对应一个屏障
+            └── TpsBarrier
+                    └── RuleBarrier（pointBarrier）  // 接口级屏障
+                            ├── maxCount             // 最大 TPS（-1 表示不限）
+                            ├── period               // 统计周期（SECONDS/MINUTES/HOURS）
+                            └── monitorType          // MONITOR（只监控）/ INTERCEPT（拦截）
+```
+
+**MonitorType 两种模式**（`MonitorType.java`）：
+- `MONITOR`：只记录指标，**不拒绝请求**（默认模式，安全上线）
+- `INTERCEPT`：超过阈值时**拒绝请求**，返回 HTTP 503 / gRPC OVER_THRESHOLD
+
+#### 14.2.2 滑动窗口计数器：LocalSimpleCountRateCounter
+
+默认实现使用**环形数组滑动窗口**（`LocalSimpleCountRateCounter.java`）：
+
+```java
+// 10 个槽位的环形数组，每个槽位对应一个时间窗口
+private List<TpsSlot> slotList;  // DEFAULT_RECORD_SIZE = 10
+
+static class TpsSlot {
+    long time;                          // 该槽位对应的时间戳（秒级对齐）
+    SlotCountHolder countHolder;        // 计数器
+}
+
+static class SlotCountHolder {
+    AtomicLong count;           // 通过请求数
+    AtomicLong interceptedCount; // 被拦截请求数
+}
+```
+
+**槽位定位算法**：
+```java
+// 根据时间戳计算槽位索引（取模环形复用）
+long diff = distance / period.toMillis(1);       // 距起始时间的周期数
+int index = (int) diff % DEFAULT_RECORD_SIZE;    // 环形索引
+// 若槽位时间戳不匹配（已过期），则重置该槽位
+if (tpsSlot.time != currentWindowTime) {
+    tpsSlot.reset(currentWindowTime);
+}
+```
+
+**优势**：无锁（AtomicLong）、内存占用固定（10个槽位）、时间复杂度 O(1)。
+
+#### 14.2.3 TPS 检查完整流程
+
+```
+gRPC 请求到达
+    │
+    ▼
+TpsControlRequestFilter.filter()（AbstractRequestFilter 子类）
+    │
+    ├── 检查 Handler 方法是否有 @TpsControl 注解
+    ├── 读取 pointName（如 "ConfigPublish"、"NamingRegisterInstance"）
+    ├── 调用对应的 RemoteTpsCheckRequestParser 解析请求
+    │
+    ▼
+ControlManagerCenter.getTpsControlManager().check(tpsCheckRequest)
+    │
+    ▼
+NacosTpsControlManager.check()
+    │
+    ├── 从 points 表中找到对应 TpsBarrier
+    ├── 调用 TpsBarrier.applyTps()
+    │
+    ▼
+NacosTpsBarrier.applyTps()
+    │
+    ├── 委托给 RuleBarrier（pointBarrier）
+    │
+    ▼
+SimpleCountRuleBarrier.applyTps()
+    │
+    ├── rateCounter.add(timestamp, count)  // 计入滑动窗口
+    ├── 判断 count > maxCount 且 monitorType == INTERCEPT
+    │     ├── 是：返回 TpsCheckResponse(false, DENY, ...)
+    │     └── 否：返回 TpsCheckResponse(true, PASS_BY_POINT, ...)
+    │
+    ▼
+TpsControlRequestFilter 根据结果决定是否拦截
+    └── 失败：response.setErrorInfo(OVER_THRESHOLD, "Tps Flow restricted")
+```
+
+**HTTP 请求**同样有对应拦截器：`NacosHttpTpsControlInterceptor`（`HandlerInterceptor`），通过 `@TpsControl` 注解识别需要限流的接口，逻辑与 gRPC 侧一致。
+
+#### 14.2.4 TPS 规则的注册与动态更新
+
+**规则注册**（服务启动时）：
+```java
+// 各业务 Handler 在初始化时调用
+ControlManagerCenter.getInstance().getTpsControlManager()
+    .registerTpsPoint("ConfigPublish");  // 注册一个限流点
+// 注册时会尝试从本地磁盘加载已有规则
+```
+
+**规则动态更新**（运行时）：
+```
+管理员通过 API 更新规则
+    │
+    ▼
+ControlManagerCenter.reloadTpsControlRule(pointName, external)
+    │
+    ▼
+NotifyCenter.publishEvent(TpsControlRuleChangeEvent)
+    │
+    ▼
+ControlRuleChangeActivator.TpsRuleChangeSubscriber.onEvent()
+    │
+    ├── 若 external=true：从外部存储拉取规则，写入本地磁盘
+    ├── 从本地磁盘读取规则内容
+    ├── RuleParser 解析为 TpsControlRule 对象
+    │
+    ▼
+TpsControlManager.applyTpsRule(pointName, rule)
+    │
+    └── TpsBarrier.applyRule(rule)  // 热更新，无需重启
+```
+
+**规则持久化路径**：`${nacos.home}/data/tps/{pointName}`
+
+#### 14.2.5 TPS 指标上报
+
+`NacosTpsControlManager` 内置定时任务（每 900ms 执行一次），通过 `TpsMetricsReporter` 将各限流点的通过数/拒绝数写入日志（`tps.log`），格式：
+```
+{pointName}|point|{period}|{时间}|{passCount}|{deniedCount}
+```
+
+### 14.3 连接数控制机制 ⭐⭐
+
+#### 14.3.1 连接控制规则
+
+```java
+// ConnectionControlRule.java
+public class ConnectionControlRule {
+    private int countLimit = -1;          // 最大连接数（-1 表示不限）
+    private Set<String> monitorIpList;    // 需要监控的 IP 列表
+}
+```
+
+**规则持久化路径**：`${nacos.home}/data/connection/limitRule`
+
+#### 14.3.2 默认实现行为
+
+`NacosConnectionControlManager`（默认实现）的 `check()` 方法**直接返回 CHECK_SKIP**（跳过检查），即默认不限制连接数。这是有意为之的设计——连接数控制需要结合实际部署情况配置，避免误伤。
+
+实际的连接数统计通过 `ConnectionMetricsCollector`（SPI）收集，`ConnectionMetricsReporter` 每 3 秒将各来源的连接数写入 `connection.log`：
+```
+ConnectionMetrics, totalCount = 1024, detail = {sdk=980, cluster=44}
+```
+
+#### 14.3.3 连接规则动态更新
+
+与 TPS 规则类似，通过 `ConnectionLimitRuleChangeEvent` 事件驱动：
+```
+ControlManagerCenter.reloadConnectionControlRule(external)
+    │
+    ▼
+NotifyCenter.publishEvent(ConnectionLimitRuleChangeEvent)
+    │
+    ▼
+ControlRuleChangeActivator.ConnectionRuleChangeSubscriber.onEvent()
+    │
+    ├── 从存储读取规则 → 解析为 ConnectionControlRule
+    └── ConnectionControlManager.applyConnectionLimitRule(rule)
+```
+
+### 14.4 SPI 扩展点汇总
+
+| SPI 接口 | 默认实现 | 扩展用途 |
+|----------|----------|----------|
+| `TpsControlManager` | `NacosTpsControlManager` | 自定义 TPS 管理器（如分布式限流） |
+| `TpsBarrierCreator` | `DefaultNacosTpsBarrierCreator` | 自定义屏障创建策略 |
+| `RuleBarrierCreator` | `LocalSimpleCountBarrierCreator` | 自定义计数器（如令牌桶、漏桶） |
+| `ConnectionControlManager` | `NacosConnectionControlManager` | 自定义连接控制逻辑 |
+| `ExternalRuleStorage` | 无（需自行实现） | 将规则存储到 Nacos 配置中心/数据库 |
+| `RuleParser` | `NacosRuleParser` | 自定义规则解析格式 |
+
+**SPI 注册方式**：在 `META-INF/services/` 下创建以接口全限定名命名的文件，写入实现类全限定名。
+
+### 14.5 关键配置参数
+
+```properties
+# 是否开启 TPS 控制（全局开关）
+nacos.plugin.control.tps.enabled=true
+
+# TPS 屏障创建器名称（对应 SPI 实现的 name()）
+nacos.plugin.control.tps.barrier.creator=nacos
+
+# 连接管理器名称
+nacos.plugin.control.connection.manager=nacos
+
+# 外部规则存储名称（空=只用本地磁盘）
+nacos.plugin.control.rule.external.storage=
+```
+
+### 14.6 面试要点 ⭐⭐
+
+**Q：Nacos 的 TPS 限流是如何实现的？**
+
+> Nacos 通过 `plugin/control/` 模块实现可插拔的 TPS 限流。核心是**环形数组滑动窗口**（`LocalSimpleCountRateCounter`，10个槽位），每个接口对应一个 `TpsBarrier`，通过 `@TpsControl` 注解标记需要限流的 Handler 方法，由 `TpsControlRequestFilter`（gRPC）和 `NacosHttpTpsControlInterceptor`（HTTP）在请求处理链中拦截检查。支持 MONITOR（只监控）和 INTERCEPT（拦截）两种模式，规则可动态更新，无需重启。
+
+**Q：如何自定义 Nacos 的限流策略（如改为令牌桶）？**
+
+> 实现 `RuleBarrierCreator` SPI 接口，在 `createRuleBarrier()` 中返回自定义的 `RuleBarrier` 实现（内部使用令牌桶算法），然后在 `META-INF/services/` 中注册，并通过 `nacos.plugin.control.tps.barrier.creator` 配置指定名称即可。
+
+---
+
+## 15. 能力协商机制（Ability）
+
+> 对应模块：`api/ability/`、`core/ability/`  
+> 核心类：`ClientAbilities`、`ServerAbilities`、`ServerAbilityInitializerHolder`
+
+### 15.1 设计背景
+
+Nacos 2.x 在 gRPC 连接建立阶段引入了**能力协商机制**：客户端上报自己支持的能力集合，服务端返回自己支持的能力集合，双方据此决定使用哪种交互方式。这解决了客户端/服务端版本不一致时的兼容性问题。
+
+### 15.2 能力数据结构
+
+#### 客户端能力（ClientAbilities）
+
+```java
+// api/ability/ClientAbilities.java
+public class ClientAbilities implements Serializable {
+    private ClientRemoteAbility remoteAbility;   // 远程通信能力
+    private ClientConfigAbility configAbility;   // 配置中心能力
+    private ClientNamingAbility namingAbility;   // 服务注册发现能力
+}
+```
+
+| 能力分组 | 类 | 典型字段 |
+|----------|-----|----------|
+| 远程通信 | `ClientRemoteAbility` | `supportRemoteConnection`（是否支持 gRPC 长连接） |
+| 配置能力 | `ClientConfigAbility` | `supportRemoteMetrics`（是否支持远程指标上报） |
+| 命名能力 | `ClientNamingAbility` | `supportDeltaPush`（是否支持增量推送）、`supportRemoteMetric` |
+
+#### 服务端能力（ServerAbilities）
+
+```java
+// api/ability/ServerAbilities.java
+public class ServerAbilities implements Serializable {
+    private ServerRemoteAbility remoteAbility;   // 远程通信能力
+    private ServerConfigAbility configAbility;   // 配置中心能力
+    private ServerNamingAbility namingAbility;   // 服务注册发现能力
+}
+```
+
+### 15.3 服务端能力初始化流程
+
+服务端能力通过 **SPI + 初始化器链** 的方式构建，支持各模块独立扩展：
+
+```
+ServerMemberManager.init()
+    │
+    ▼
+initMemberAbilities()
+    │
+    ├── 创建空的 ServerAbilities 对象
+    ├── 遍历 ServerAbilityInitializerHolder.getInitializers()
+    │     └── 通过 NacosServiceLoader.load(ServerAbilityInitializer.class) 加载所有 SPI 实现
+    │           ├── RemoteAbilityInitializer
+    │           │     └── abilities.getRemoteAbility().setSupportRemoteConnection(true)
+    │           └── （其他模块注册的 Initializer）
+    │
+    ▼
+self.setAbilities(serverAbilities)  // 写入本节点的 Member 元数据
+```
+
+**SPI 注册**：各模块在 `META-INF/services/com.alibaba.nacos.core.ability.ServerAbilityInitializer` 中注册自己的初始化器，实现**开闭原则**——新增能力无需修改核心代码。
+
+### 15.4 连接建立时的能力交换
+
+能力协商发生在 **gRPC 双向流建立阶段**（`ConnectionSetupRequest`）：
+
+```
+客户端发起 gRPC 连接
+    │
+    ▼
+发送 ConnectionSetupRequest
+    ├── clientVersion
+    ├── labels
+    ├── tenant
+    └── abilities（ClientAbilities 对象）  ← 客户端上报自己的能力
+    │
+    ▼
+GrpcBiStreamRequestAcceptor.onNext()
+    │
+    ├── 解析 ConnectionSetupRequest
+    ├── 创建 GrpcConnection 对象
+    ├── connection.setAbilities(setUpRequest.getAbilities())  ← 保存客户端能力
+    ├── 注册到 ConnectionManager
+    │
+    ▼
+服务端返回 ConnectResetRequest（含 ServerAbilities）
+    └── 客户端据此了解服务端支持的能力
+```
+
+**Connection 对象持有 ClientAbilities**（`Connection.java`）：
+```java
+public abstract class Connection implements Requester {
+    private ClientAbilities abilities;  // 该连接对应客户端的能力
+    // ...
+}
+```
+
+服务端在处理请求时，可通过 `connection.getAbilities()` 判断客户端是否支持某项能力，从而选择不同的处理路径（如：客户端支持增量推送则发增量，否则发全量）。
+
+### 15.5 集群节点间的能力同步
+
+`ServerAbilities` 不仅用于客户端协商，也用于**集群节点间的能力感知**：
+
+```java
+// ServerMemberManager 中，每个 Member 对象携带 ServerAbilities
+Member.setAbilities(serverAbilities);
+```
+
+节点间通过心跳（`/cluster/report`）交换 Member 信息，包含各节点的 `ServerAbilities`，使得集群中每个节点都知道其他节点支持哪些能力，从而在集群内部通信时选择最优协议。
+
+### 15.6 扩展：如何新增一个能力字段
+
+以新增「支持批量注册」能力为例：
+
+1. 在 `ClientNamingAbility` 中添加字段 `supportBatchRegister`
+2. 在 `ServerNamingAbility` 中添加字段 `supportBatchRegister`
+3. 实现 `ServerAbilityInitializer`，在 `initialize()` 中设置 `abilities.getNamingAbility().setSupportBatchRegister(true)`
+4. 在 `META-INF/services/` 中注册该初始化器
+5. 服务端处理注册请求时，通过 `connection.getAbilities().getNamingAbility().isSupportBatchRegister()` 判断是否走批量路径
+
+### 15.7 面试要点 ⭐
+
+**Q：Nacos 2.x 的能力协商机制是什么？解决了什么问题？**
+
+> 能力协商是 Nacos 2.x 在 gRPC 连接建立时引入的版本兼容机制。客户端通过 `ConnectionSetupRequest` 上报 `ClientAbilities`（支持的功能集合），服务端通过 `ServerAbilities` 告知自己的能力。双方据此选择最优的交互方式，解决了客户端/服务端版本不一致时的兼容性问题（如老客户端连接新服务端，服务端不会发送老客户端不支持的增量推送）。服务端能力通过 SPI（`ServerAbilityInitializer`）扩展，各模块独立注册，符合开闭原则。
+
+---
+
+*文档生成时间：2026-03-05*  
 *对应源码版本：Nacos 2.x*

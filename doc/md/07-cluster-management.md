@@ -300,6 +300,186 @@ watcher.onChange(event) → readClusterConfFromDisk() → afterLookup() → memb
 
 ---
 
+### 2.5 AddressServerMemberLookup 详细流程
+
+`AddressServerMemberLookup` 是生产环境中最常用的寻址策略（无 `cluster.conf` 时默认使用），通过轮询外部地址服务器 HTTP 接口获取集群节点列表。
+
+#### 关键字段
+
+```java
+public class AddressServerMemberLookup extends AbstractMemberLookup {
+    public String domainName;           // 地址服务器域名（默认 jmenv.tbsite.net）
+    public String addressPort;          // 地址服务器端口（默认 8080）
+    public String addressUrl;           // 地址服务器路径（默认 /nacos/serverlist）
+    public String addressServerUrl;     // 完整 URL = http://domainName:port/path
+    
+    private volatile boolean isAddressServerHealth = true;  // 地址服务器是否健康
+    private int addressServerFailCount = 0;                 // 连续失败次数
+    private int maxFailCount = 12;                          // 最大失败次数（超过则标记不健康）
+    
+    private static final int DEFAULT_SERVER_RETRY_TIME = 5;         // 启动时重试次数
+    private static final long DEFAULT_SYNC_TASK_DELAY_MS = 5_000L;  // 轮询间隔 5 秒
+}
+```
+
+#### 配置优先级（三级覆盖）
+
+| 优先级 | 来源 | 示例 |
+|--------|------|------|
+| 1（最高） | 环境变量 | `address_server_domain=my-addr-server.com` |
+| 2 | `application.properties` | `address.server.domain=my-addr-server.com` |
+| 3（默认） | 硬编码默认值 | `jmenv.tbsite.net:8080` |
+
+#### 启动流程
+
+```mermaid
+flowchart TD
+    A[AddressServerMemberLookup.doStart] --> B[initAddressSys 初始化地址服务器URL]
+    B --> C[run 启动同步]
+    C --> D{循环重试 maxRetry=5 次}
+    D -->|成功| E[syncFromAddressUrl 同步节点列表]
+    D -->|全部失败| F[抛出 NacosException 启动失败]
+    E --> G[HTTP GET addressServerUrl]
+    G -->|200 OK| H[解析响应体 ip:port 列表]
+    H --> I[afterLookup → memberChange]
+    I --> J[scheduleByCommon AddressServerSyncTask 5秒后]
+    G -->|非200| K[addressServerFailCount++]
+    K -->|failCount >= 12| L[isAddressServerHealth = false]
+    K --> J
+    J --> M[每5秒循环执行 syncFromAddressUrl]
+```
+
+#### 地址服务器响应格式
+
+地址服务器返回纯文本，每行一个 `ip:port`：
+
+```
+192.168.1.1:8848
+192.168.1.2:8848
+192.168.1.3:8848
+```
+
+`MemberUtil.readServerConf(EnvUtil.analyzeClusterConf(reader))` 负责解析，支持注释行（`#` 开头）和空行过滤。
+
+#### 健康状态监控
+
+```java
+// 可通过 REST API 查询地址服务器健康状态
+GET /nacos/v1/core/cluster/lookup/info
+// 返回：
+{
+  "addressServerHealth": true,
+  "addressServerUrl": "http://jmenv.tbsite.net:8080/nacos/serverlist",
+  "addressServerFailCount": 0
+}
+```
+
+---
+
+### 2.6 集群扩缩容完整时序
+
+#### 扩容（新增节点）
+
+```mermaid
+sequenceDiagram
+    participant Admin as 运维人员
+    participant NewNode as 新节点
+    participant Lookup as MemberLookup
+    participant SMM as ServerMemberManager
+    participant Raft as JRaftServer
+    participant Distro as DistroProtocol
+
+    Admin->>NewNode: 启动新节点（配置 cluster.conf 或地址服务器）
+    NewNode->>Lookup: initAndStartLookup()
+    Lookup->>SMM: afterLookup([node1, node2, newNode])
+    SMM->>SMM: memberChange() 检测到新节点
+    SMM->>SMM: syncToFile(cluster.conf) 持久化
+    SMM->>Raft: MembersChangeEvent
+    SMM->>Distro: MembersChangeEvent
+    Raft->>Raft: 重新选举 Leader（新节点加入 Peer 列表）
+    Distro->>Distro: 重新计算负责节点范围
+    
+    Note over NewNode,Distro: 新节点开始接收 Distro 数据同步
+    NewNode->>SMM: MemberInfoReportTask 向其他节点上报心跳
+    SMM->>SMM: update(newMember) 更新 extendInfo/abilities
+```
+
+#### 缩容（节点下线）
+
+```mermaid
+sequenceDiagram
+    participant Admin as 运维人员
+    participant DownNode as 下线节点
+    participant OtherNode as 其他节点
+    participant SMM as ServerMemberManager
+    participant Raft as JRaftServer
+
+    Admin->>DownNode: 停止节点进程
+    OtherNode->>SMM: MemberInfoReportTask 心跳失败
+    SMM->>SMM: MemberUtil.onFail() failCnt++
+    Note over SMM: failCnt=1 → SUSPICIOUS
+    Note over SMM: failCnt>3 → DOWN
+    
+    alt 使用 FileConfigMemberLookup
+        Admin->>OtherNode: 修改 cluster.conf 删除下线节点
+        OtherNode->>SMM: WatchFileCenter 触发 memberChange()
+        SMM->>Raft: MembersChangeEvent（节点减少）
+    else 使用 AddressServerMemberLookup
+        Admin->>Admin: 更新地址服务器节点列表
+        OtherNode->>SMM: 5秒后 syncFromAddressUrl 拉取新列表
+        SMM->>Raft: MembersChangeEvent（节点减少）
+    end
+    
+    Raft->>Raft: 重新选举（若 Leader 下线）
+```
+
+#### 关键设计：`memberLeave` vs `memberChange`
+
+```java
+// memberLeave：只能通过 REST API 手动触发，不会自动触发
+public boolean memberLeave(Collection<Member> members) {
+    members.forEach(m -> {
+        serverList.remove(m.getAddress());
+        memberAddressInfos.remove(m.getAddress());
+    });
+    return memberChange(allMembers());
+}
+
+// memberChange：Lookup 自动触发（文件变化/地址服务器轮询）
+// 区别：memberLeave 是主动剔除，memberChange 是被动同步
+```
+
+> ⚠️ **重要**：节点 DOWN 状态**不会**自动从 `serverList` 中删除！  
+> DOWN 状态只影响 `memberAddressInfos`（健康节点集合），`serverList` 中仍保留该节点。  
+> 真正从列表中删除节点，需要通过 `memberLeave()` 或 Lookup 重新同步（新列表中不含该节点）。
+
+---
+
+### 2.7 MembersChangeEvent 下游响应链
+
+`memberChange()` 发布 `MembersChangeEvent` 后，多个组件会响应：
+
+```mermaid
+flowchart LR
+    A[MembersChangeEvent] --> B[JRaftServer]
+    A --> C[DistroProtocol]
+    A --> D[NacosStateMachine]
+    A --> E[ClusterVersionJudgement]
+    
+    B --> B1[重新配置 Raft Peer 列表\nRaftGroupService.changePeers]
+    C --> C1[重新计算 Distro 负责节点\nDistroMapper.refresh]
+    D --> D1[更新状态机成员列表]
+    E --> E1[判断集群是否全部升级到 2.x\n影响 gRPC/HTTP 协议选择]
+```
+
+| 订阅者 | 响应动作 | 影响 |
+|--------|---------|------|
+| `JRaftServer` | 重新配置 Raft Peer 列表 | Raft 选举和日志复制范围变化 |
+| `DistroProtocol` | 刷新 `DistroMapper` 负责节点 | 临时实例的负责节点重新分配 |
+| `ClusterVersionJudgement` | 判断集群版本一致性 | 影响是否启用 gRPC 长连接 |
+
+---
+
 ## 第3部分：运行时验证
 
 ### 验证目标

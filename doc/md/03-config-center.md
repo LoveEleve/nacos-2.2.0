@@ -487,11 +487,278 @@ public static boolean isDirectRead() {
 
 ---
 
-## 数据结构关系图
+## 补充章节：配置中心客户端 SDK 核心机制
+
+> 对应章节 38-41（NacosConfigService、ClientWorker、CacheData 配置客户端）  
+> 源码路径：`client/src/main/java/com/alibaba/nacos/client/config/`
+
+---
+
+### S1. NacosConfigService — 配置客户端入口
+
+`NacosConfigService` 是配置中心客户端的门面类，用户直接使用的 API 入口：
+
+```java
+// client/src/main/java/com/alibaba/nacos/client/config/NacosConfigService.java
+public class NacosConfigService implements ConfigService {
+    
+    // ★ 核心：所有配置操作委托给 ClientWorker
+    private final ClientWorker worker;
+    
+    // ★ 命名空间
+    private final String namespace;
+    
+    // ★ 配置过滤链（加密/解密插件在此处理）
+    private final ConfigFilterChainManager configFilterChainManager;
+    
+    public NacosConfigService(Properties properties) throws NacosException {
+        // 初始化 namespace、configFilterChainManager
+        // 创建 ClientWorker（内部创建 gRPC 连接）
+        this.worker = new ClientWorker(configFilterChainManager, serverListManager, nacosClientProperties);
+    }
+    
+    @Override
+    public String getConfig(String dataId, String group, long timeoutMs) throws NacosException {
+        return getConfigInner(namespace, dataId, group, timeoutMs);
+    }
+    
+    @Override
+    public boolean publishConfig(String dataId, String group, String content) throws NacosException {
+        return publishConfigInner(namespace, dataId, group, null, null, null, content, ConfigType.getDefaultType().getType(), null);
+    }
+    
+    @Override
+    public boolean addListener(String dataId, String group, Listener listener) throws NacosException {
+        worker.addListeners(dataId, group, Collections.singletonList(listener));
+        return true;
+    }
+}
+```
+
+**`getConfigInner()` 的三级查询策略**：
+
+```java
+private String getConfigInner(String tenant, String dataId, String group, long timeoutMs) throws NacosException {
+    // ★ 第一级：本地故障转移文件（优先级最高）
+    String content = LocalConfigInfoProcessor.getFailover(worker.getAgentName(), dataId, group, tenant);
+    if (content != null) {
+        return content;  // 使用本地故障转移配置
+    }
+    
+    // ★ 第二级：从服务端拉取（gRPC 请求）
+    try {
+        ConfigResponse response = worker.getServerConfig(dataId, group, tenant, timeoutMs, false);
+        return response.getContent();
+    } catch (NacosException e) {
+        // ★ 第三级：服务端不可用，使用本地快照
+        content = LocalConfigInfoProcessor.getSnapshot(worker.getAgentName(), dataId, group, tenant);
+        return content;
+    }
+}
+```
+
+---
+
+### S2. ClientWorker — 配置监听核心
+
+`ClientWorker` 是配置客户端的核心工作类，负责：
+1. 维护本地配置缓存（`cacheMap`）
+2. 通过 gRPC 长连接监听配置变更（`ConfigBatchListenRequest`）
+3. 收到变更通知后拉取最新配置，触发用户监听器
+
+#### 数据结构
+
+```java
+// client/src/main/java/com/alibaba/nacos/client/config/impl/ClientWorker.java
+public class ClientWorker implements Closeable {
+    
+    // ★ 核心：groupKey → CacheData（本地配置缓存）
+    private final AtomicReference<Map<String, CacheData>> cacheMap 
+        = new AtomicReference<>(new HashMap<>());
+    
+    // ★ gRPC 传输客户端（内部管理 RpcClient）
+    private ConfigTransportClient agent;
+    
+    // ★ 调度器（用于定时检查 CacheData 的监听器）
+    private ScheduledExecutorService executorService;
+    
+    // ★ 是否启动时同步远端配置
+    private boolean enableRemoteSyncConfig = false;
+}
+```
+
+#### 监听配置变更的完整流程
+
+```
+① 用户调用 addListener(dataId, group, listener)
+    │
+    ▼
+ClientWorker.addListeners()
+    → addCacheDataIfAbsent(dataId, group)  // 创建或获取 CacheData
+    → cache.addListener(listener)           // 注册监听器
+    → agent.notifyListenConfig()            // 通知 gRPC 客户端更新监听列表
+
+② ConfigRpcTransportClient 处理监听请求
+    → 构建 ConfigBatchListenRequest（包含所有 CacheData 的 groupKey + MD5）
+    → 发送给服务端
+    → 服务端比对 MD5，返回有变更的 groupKey 列表
+
+③ 服务端配置变更时（主动 Push）
+    → 服务端发送 ConfigChangeNotifyRequest（只含 groupKey）
+    → 客户端 ConfigRpcTransportClient 收到后：
+        cache.setConsistentWithServer(false)  // 标记需要重新拉取
+        agent.notifyListenConfig()            // 触发重新发送 ConfigBatchListenRequest
+
+④ 客户端拉取最新配置
+    → 发送 ConfigQueryRequest(dataId, group, tenant)
+    → 服务端返回最新配置内容
+    → cache.setContent(content)  // 更新本地缓存
+    → cache.checkListenerMd5()   // 比对 MD5，触发监听器
+```
+
+**`ConfigBatchListenRequest` 的设计**：
+
+```java
+// 客户端发送的批量监听请求（包含所有订阅的配置的 MD5）
+ConfigBatchListenRequest request = new ConfigBatchListenRequest();
+for (CacheData cacheData : caches) {
+    request.addConfigListenContext(
+        cacheData.group, cacheData.dataId, cacheData.tenant, cacheData.getMd5());
+}
+// 服务端收到后，比对每个配置的 MD5：
+// - MD5 相同 → 无变更，不返回
+// - MD5 不同 → 有变更，返回该 groupKey
+```
+
+---
+
+### S3. CacheData — 单个配置的客户端缓存
+
+`CacheData` 是客户端对单个配置的完整缓存，包含内容、MD5、监听器列表：
+
+```java
+// client/src/main/java/com/alibaba/nacos/client/config/impl/CacheData.java
+public class CacheData {
+    
+    public final String dataId;
+    public final String group;
+    public final String tenant;
+    
+    // ★ 配置内容（volatile 保证可见性）
+    private volatile String content;
+    
+    // ★ 当前内容的 MD5（用于变更检测）
+    private volatile String md5;
+    
+    // ★ 监听器列表（CopyOnWriteArrayList 保证并发安全）
+    private final CopyOnWriteArrayList<ManagerListenerWrap> listeners;
+    
+    // ★ 是否使用本地配置（故障转移时为 true）
+    private volatile boolean isUseLocalConfig = false;
+    
+    // ★ 本地配置最后修改时间（用于检测本地文件是否变更）
+    private volatile long localConfigLastModified;
+    
+    // ★ 是否与服务端一致（false 时需要重新拉取）
+    private volatile boolean consistentWithServer;
+    
+    // ★ 加密数据密钥（企业版加密配置）
+    private volatile String encryptedDataKey;
+    
+    // ★ 内部通知线程池（最多 5 个线程，SynchronousQueue 无缓冲）
+    static final ThreadPoolExecutor INTERNAL_NOTIFIER = new ThreadPoolExecutor(
+        0, CONCURRENCY, 60L, TimeUnit.SECONDS, new SynchronousQueue<>(), ...);
+}
+```
+
+**`checkListenerMd5()` — MD5 比对触发监听器**：
+
+```java
+// CacheData.java:checkListenerMd5()
+void checkListenerMd5() {
+    for (ManagerListenerWrap wrap : listeners) {
+        if (!md5.equals(wrap.lastCallMd5)) {
+            // ★ MD5 变化，触发监听器（异步执行，避免阻塞）
+            safeNotifyListener(dataId, group, content, type, md5, encryptedDataKey, wrap);
+        }
+    }
+}
+
+private void safeNotifyListener(String dataId, String group, String content, ..., ManagerListenerWrap wrap) {
+    Listener listener = wrap.listener;
+    // ★ 提交到 INTERNAL_NOTIFIER 线程池异步执行
+    INTERNAL_NOTIFIER.execute(() -> {
+        try {
+            // 执行配置过滤链（解密等）
+            ConfigResponse cr = new ConfigResponse();
+            cr.setDataId(dataId);
+            cr.setGroup(group);
+            cr.setContent(content);
+            configFilterChainManager.doFilter(null, cr);
+            
+            // ★ 回调用户监听器
+            listener.receiveConfigInfo(cr.getContent());
+            
+            // ★ 更新 lastCallMd5，避免重复触发
+            wrap.lastCallMd5 = md5;
+        } catch (Exception e) {
+            // 监听器异常不影响其他监听器
+        }
+    });
+}
+```
+
+**`ManagerListenerWrap` — 监听器包装**：
+
+```java
+// 包装用户监听器，记录上次回调时的 MD5
+private static class ManagerListenerWrap {
+    final Listener listener;
+    volatile String lastCallMd5 = CacheData.getMd5String(null);  // 初始为空内容的 MD5
+    volatile String lastContent = null;
+}
+```
+
+**设计要点**：
+- `lastCallMd5` 记录上次触发监听器时的 MD5，而非当前 MD5。这样即使配置内容相同（MD5 相同），也不会重复触发。
+- `INTERNAL_NOTIFIER` 使用 `SynchronousQueue`（无缓冲），最多 5 个并发通知线程，超出时直接拒绝（`RejectedExecutionException`），防止监听器堆积。
+
+---
+
+### S4. 客户端配置操作完整链路
 
 ```mermaid
-classDiagram
-    class ConfigCacheService {
+sequenceDiagram
+    participant User as 用户代码
+    participant NCS as NacosConfigService
+    participant CW as ClientWorker
+    participant CD as CacheData
+    participant RPC as ConfigRpcTransportClient
+    participant Server as Nacos服务端
+
+    User->>NCS: addListener(dataId, group, listener)
+    NCS->>CW: addListeners(dataId, group, [listener])
+    CW->>CD: addCacheDataIfAbsent(dataId, group)
+    CD-->>CW: CacheData（新建或已有）
+    CW->>CD: cache.addListener(listener)
+    CW->>RPC: notifyListenConfig()
+    RPC->>Server: ConfigBatchListenRequest（含所有 CacheData 的 MD5）
+    Server-->>RPC: 返回有变更的 groupKey 列表（首次可能为空）
+
+    Note over Server: 配置发生变更
+    Server->>RPC: ConfigChangeNotifyRequest（Push，只含 groupKey）
+    RPC->>CD: setConsistentWithServer(false)
+    RPC->>RPC: notifyListenConfig()
+    RPC->>Server: ConfigBatchListenRequest（重新发送）
+    Server-->>RPC: 返回变更的 groupKey
+    RPC->>Server: ConfigQueryRequest（拉取最新内容）
+    Server-->>RPC: 配置内容 + MD5
+    RPC->>CD: setContent(content) + setMd5(md5)
+    CD->>CD: checkListenerMd5()
+    CD->>User: listener.receiveConfigInfo(content)（异步回调）
+```
+
+
         -CACHE: ConcurrentHashMap~String,CacheItem~
         +dump(dataId, group, tenant, content)
         +updateMd5(groupKey, md5, ts)

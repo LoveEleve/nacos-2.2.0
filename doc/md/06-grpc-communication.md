@@ -571,6 +571,243 @@ classDiagram
 
 ---
 
+## 补充章节：客户端 RpcClient 状态机与重连机制
+
+> 对应章节 6（完善 RpcClient 类，实现客户端心跳检测、断线重连功能）  
+> 源码路径：`common/src/main/java/com/alibaba/nacos/common/remote/client/RpcClient.java`
+
+---
+
+### S1. RpcClient 状态机
+
+`RpcClient` 是所有 Nacos 客户端（Naming/Config）的底层 gRPC 连接抽象，其生命周期由 `RpcClientStatus` 枚举管理：
+
+```java
+// common/src/main/java/com/alibaba/nacos/common/remote/client/RpcClientStatus.java
+public enum RpcClientStatus {
+    WAIT_INIT(0, "Wait to init server list factory..."),   // 初始状态，等待 ServerListFactory 注入
+    INITIALIZED(1, "Server list factory is ready..."),     // 已初始化，等待 start()
+    STARTING(2, "Client already staring..."),              // start() 已调用，正在建立连接
+    UNHEALTHY(3, "Client unhealthy, in reconnecting"),     // 心跳检测失败，正在重连
+    RUNNING(4, "Client is running"),                       // 连接正常，可处理请求
+    SHUTDOWN(5, "Client is shutdown")                      // 已关闭，不可恢复
+}
+```
+
+**状态转换图**：
+
+```
+WAIT_INIT
+    │ serverListFactory() 注入
+    ▼
+INITIALIZED
+    │ start() 调用
+    ▼
+STARTING
+    │ connectToServer() 成功
+    ▼
+RUNNING ◄──────────────────────────────────────────────────────┐
+    │                                                           │
+    │ healthCheck() 失败（心跳超时）                              │
+    ▼                                                           │
+UNHEALTHY                                                       │
+    │ reconnect() 成功                                          │
+    └───────────────────────────────────────────────────────────┘
+    │ reconnect() 失败（所有服务端均不可达）
+    └── 继续保持 UNHEALTHY，每次重连间隔递增，直到成功
+
+RUNNING / UNHEALTHY
+    │ shutdown() 调用
+    ▼
+SHUTDOWN（终态）
+```
+
+**关键字段**：
+
+```java
+public abstract class RpcClient implements Closeable {
+    // ★ 状态机（AtomicReference 保证 CAS 原子转换）
+    protected volatile AtomicReference<RpcClientStatus> rpcClientStatus 
+        = new AtomicReference<>(RpcClientStatus.WAIT_INIT);
+    
+    // ★ 当前连接（volatile 保证可见性）
+    protected volatile Connection currentConnection;
+    
+    // ★ 重连信号队列（容量 1，防止重复触发）
+    private final BlockingQueue<ReconnectContext> reconnectionSignal = new ArrayBlockingQueue<>(1);
+    
+    // ★ 最后活跃时间戳（用于判断是否需要心跳检测）
+    private long lastActiveTimeStamp = System.currentTimeMillis();
+    
+    // ★ 连接事件监听器（NamingGrpcRedoService 注册在此）
+    protected List<ConnectionEventListener> connectionEventListeners = new ArrayList<>();
+    
+    // ★ 服务端 Push 处理器（NamingPushRequestHandler 注册在此）
+    protected List<ServerRequestHandler> serverRequestHandlers = new ArrayList<>();
+}
+```
+
+---
+
+### S2. 心跳检测机制
+
+`start()` 方法启动一个 2 线程的 `ScheduledThreadPoolExecutor`（`clientEventExecutor`），其中一个线程专门负责心跳检测和重连：
+
+```java
+// RpcClient.java:start() 中的重连线程
+clientEventExecutor.submit(() -> {
+    while (true) {
+        if (isShutdown()) break;
+        
+        // ★ 阻塞等待重连信号，超时时间 = connectionKeepAlive（默认 5000ms）
+        ReconnectContext reconnectContext = reconnectionSignal
+                .poll(rpcClientConfig.connectionKeepAlive(), TimeUnit.MILLISECONDS);
+        
+        if (reconnectContext == null) {
+            // 超时未收到重连信号，检查最后活跃时间
+            if (System.currentTimeMillis() - lastActiveTimeStamp >= rpcClientConfig.connectionKeepAlive()) {
+                // ★ 发送 HealthCheckRequest，等待服务端响应
+                boolean isHealthy = healthCheck();
+                if (!isHealthy) {
+                    // ★ 心跳失败：状态转为 UNHEALTHY，触发重连
+                    rpcClientStatus.compareAndSet(currentStatus, RpcClientStatus.UNHEALTHY);
+                    reconnectContext = new ReconnectContext(null, false);
+                } else {
+                    // 心跳成功：更新最后活跃时间
+                    lastActiveTimeStamp = System.currentTimeMillis();
+                    continue;
+                }
+            } else {
+                continue;  // 距上次活跃时间未超过 keepAlive，跳过
+            }
+        }
+        // 执行重连...
+        reconnect(reconnectContext.serverInfo, reconnectContext.onRequestFail);
+    }
+});
+```
+
+**心跳检测参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `connectionKeepAlive` | **5000ms** | 心跳间隔（`RpcClientTlsConfig` 中配置） |
+| `healthCheckRetryTimes` | **3次** | 心跳失败重试次数 |
+| `healthCheckTimeOut` | **3000ms** | 单次心跳超时时间 |
+
+**`healthCheck()` 实现**：
+
+```java
+// RpcClient.java:healthCheck()
+private boolean healthCheck() {
+    HealthCheckRequest healthCheckRequest = new HealthCheckRequest();
+    if (this.currentConnection == null) {
+        return false;
+    }
+    int reTryTimes = rpcClientConfig.healthCheckRetryTimes();
+    while (reTryTimes >= 0) {
+        try {
+            // ★ 发送 HealthCheckRequest，超时 3000ms
+            Response response = this.currentConnection.request(healthCheckRequest, 
+                    rpcClientConfig.healthCheckTimeOut());
+            return response != null && response.isSuccess();
+        } catch (NacosException e) {
+            reTryTimes--;
+        }
+    }
+    return false;
+}
+```
+
+---
+
+### S3. 断线重连机制
+
+**触发重连的两种方式**：
+
+1. **主动触发**：服务端发送 `ConnectResetRequest`（如服务端负载均衡需要客户端切换节点）
+2. **被动触发**：心跳检测失败，状态变为 `UNHEALTHY`，重连线程自动触发
+
+```java
+// RpcClient.java:reconnect()
+private void reconnect(final ServerInfo recommendServerInfo, boolean onRequestFail) {
+    try {
+        AtomicReference<ServerInfo> recommendServer = new AtomicReference<>(recommendServerInfo);
+        
+        if (onRequestFail && healthCheck()) {
+            // 请求失败触发的重连，但心跳检测成功 → 不需要重连
+            rpcClientStatus.set(RpcClientStatus.RUNNING);
+            return;
+        }
+        
+        // ★ 关闭旧连接，通知监听器（触发 NamingGrpcRedoService.onDisConnect()）
+        closeConnection(currentConnection);
+        currentConnection = null;
+        
+        // ★ 遍历服务端列表，尝试建立新连接
+        int connectCount = 0;
+        int connectEnsure = 0;
+        Connection newConnection = null;
+        
+        while (!isShutdown()) {
+            try {
+                connectCount++;
+                ServerInfo serverInfo = recommendServer.get() != null 
+                    ? recommendServer.getAndSet(null)
+                    : nextRpcServer();  // 轮询下一个服务端
+                
+                newConnection = connectToServer(serverInfo);
+                if (newConnection != null) {
+                    // ★ 重连成功：更新 currentConnection，状态转为 RUNNING
+                    currentConnection = newConnection;
+                    rpcClientStatus.set(RpcClientStatus.RUNNING);
+                    // ★ 通知监听器（触发 NamingGrpcRedoService.onConnected()）
+                    eventLinkedBlockingQueue.offer(new ConnectionEvent(ConnectionEvent.CONNECTED));
+                    return;
+                }
+            } catch (Exception e) {
+                // 连接失败，继续尝试下一个服务端
+            }
+            
+            if (connectCount > getServerListFactory().getServerList().size()) {
+                // 所有服务端均尝试过，等待一段时间后重试
+                Thread.sleep(Math.min(connectEnsure++, 5) * 1000L);
+            }
+        }
+    } catch (Exception e) {
+        // 重连过程中的异常
+    }
+}
+```
+
+**重连间隔策略**：每轮尝试所有服务端后，等待时间递增（`min(尝试轮数, 5) * 1000ms`），最大等待 5 秒，避免频繁重连。
+
+---
+
+### S4. 服务端主动切换（ConnectResetRequest）
+
+服务端可以主动要求客户端切换到指定节点（用于负载均衡）：
+
+```java
+// RpcClient.java 中处理 ConnectResetRequest
+// 注册在 serverRequestHandlers 中，收到服务端 Push 时触发
+if (serverRequest instanceof ConnectResetRequest) {
+    ConnectResetRequest connectResetRequest = (ConnectResetRequest) serverRequest;
+    if (StringUtils.isNotBlank(connectResetRequest.getServerIp())) {
+        // ★ 服务端指定了目标节点，切换到该节点
+        ServerInfo serverInfo = resolveServerInfo(
+            connectResetRequest.getServerIp() + ":" + connectResetRequest.getServerPort());
+        switchServerAsync(serverInfo);
+    } else {
+        // ★ 服务端未指定节点，随机切换到其他节点
+        switchServerAsync();
+    }
+    return new ConnectResetResponse();
+}
+```
+
+---
+
 *文档生成时间：2026-03-04*  
 *对应源码版本：Nacos 2.2.0*  
 *运行时验证环境：standalone 模式，nacos-client v2.2.0*
